@@ -75,11 +75,43 @@ are set.
 
 1. Read and parse `topics.txt` (path relative to the script, so CWD doesn't
    matter).
-2. Pick one topic at random.
-3. Ask Gemini via REST (`generateContent`) for a single fun fact — Bengali/Hindi
-   terms are returned in native script with a transliteration and gloss.
-4. Compose an HTML message: a bold topic header plus the (HTML-escaped) fact.
-5. Send it with Telegram `sendMessage` (`parse_mode=HTML`).
+2. Load `data/history.jsonl` (all previously sent facts).
+3. Pick one topic at random.
+4. Ask Gemini via REST (`generateContent`) for a single **new** fun fact,
+   returned as compact JSON `{"title": ..., "fact": ...}`. The prompt includes
+   the recent facts already sent for that topic and asks the model not to
+   repeat them. Bengali/Hindi terms are written inline in native script with a
+   transliteration and gloss, in plain text.
+5. Parse the JSON robustly (handles ```json fences and stray prose; falls back
+   to the raw text with the topic as title). A SHA-256 hash of the normalized
+   fact (lowercased, punctuation stripped, whitespace collapsed) is compared
+   against history; on a duplicate it regenerates up to 4 times before sending
+   anyway.
+6. Compose a compact HTML message and send it with Telegram `sendMessage`
+   (`parse_mode=HTML`):
+
+   ```
+   💡 <b>{title}</b>
+   <i>{topic}</i>
+
+   {fact}
+   ```
+
+   `title`, `topic`, and `fact` are all HTML-escaped, so the model can never
+   produce Markdown/HTML that breaks rendering or 400s Telegram.
+7. Only after a successful send, append the fact to `data/history.jsonl`. In
+   GitHub Actions the workflow commits and pushes that file back to the repo
+   (`permissions: contents: write`), so de-duplication persists across the
+   otherwise stateless runners. These `[skip ci]` pushes use `GITHUB_TOKEN`
+   and do not retrigger the workflow.
 
 The script exits `0` on success and non-zero only on a real model or delivery
 failure, so failed runs show up clearly in the Actions log.
+
+### De-duplication
+
+History lives in `data/history.jsonl` — one JSON object per line with `ts`,
+`topic`, `title`, `fact`, and `hash`. It starts empty and grows by one line
+per successful send. It's safe to edit or clear if you ever want to allow
+older facts to reappear.
+
