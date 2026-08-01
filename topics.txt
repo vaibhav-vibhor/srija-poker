@@ -1,0 +1,17 @@
+# Fun facts topics — one per line.
+# Blank lines and lines starting with '#' are ignored.
+# Surrounding whitespace is stripped. Edit or add your own topics freely.
+Language
+History of language and how languages evolve
+Word origins and etymology in English, Hindi, or Bengali
+Geography
+West Bengal
+History of West Bengal
+Bengali writers and their stories
+Bengali poets and their poems
+The Paleolithic Age
+The Mesolithic Age
+The Neolithic Age
+The Chalcolithic Age
+The Bronze Age
+The Iron Age
