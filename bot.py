@@ -27,7 +27,7 @@ log = logging.getLogger("funfacts")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOPICS_PATH = os.path.join(SCRIPT_DIR, "topics.txt")
 
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "{model}:generateContent?key={key}"
