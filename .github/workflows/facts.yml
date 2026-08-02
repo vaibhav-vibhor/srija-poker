@@ -40,6 +40,8 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          CHECKIN_NAME: ${{ vars.CHECKIN_NAME }}
+          CHECKIN_PROBABILITY: ${{ vars.CHECKIN_PROBABILITY }}
         run: python bot.py
 
       - name: Save history
