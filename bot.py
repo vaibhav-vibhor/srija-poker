@@ -48,19 +48,54 @@ AVOID_LIST_SIZE = 30
 # How many retries when a generated fact duplicates something already sent.
 MAX_DEDUP_RETRIES = 4
 
+# Occasional personal check-in configuration (overridable via env).
+DEFAULT_CHECKIN_NAME = "Sreeja"
+DEFAULT_CHECKIN_PROBABILITY = 0.10
+# Reject an over-long model check-in and fall back to a curated line instead.
+MAX_CHECKIN_CHARS = 120
+
+# Curated, hand-written fallback check-ins. Used when the model omits/garbles
+# the line. {name} is substituted at render time.
+CHECKIN_FALLBACKS = [
+    "How are you doing, {name}? Hope your mind's at ease today.",
+    "Quick check-in, {name} — you doing okay?",
+    "Sending a smile your way, {name}. All good?",
+    "Hey {name}, how's your heart today?",
+    "Just checking in, {name} — mind at peace?",
+    "Hope you're smiling today, {name}. Doing alright?",
+    "How's it going, {name}? Taking care of yourself?",
+    "Thinking of you, {name}. Everything okay on your end?",
+    "You good, {name}? Hope today's been kind to you.",
+    "Little hello, {name} — how are you really doing?",
+    "Hey {name}, breathe easy today. All well?",
+    "Checking in on you, {name}. Mind feeling light?",
+    "Hope your day's gentle, {name}. You holding up okay?",
+    "How are you, {name}? Wishing you a calm day.",
+    "Warm hello, {name} — is your mind at rest today?",
+    "You okay, {name}? Sending some good vibes your way.",
+    "Hey {name}, hope you're being kind to yourself today.",
+    "Just a nudge, {name} — how's your headspace?",
+    "Hope all's well, {name}. Feeling okay today?",
+    "Take a breath, {name}. How are you doing, really?",
+]
+
 PROMPT_TEMPLATE = (
     "Give me ONE genuinely interesting, surprising fun fact about the topic: "
     "\"{topic}\".\n\n"
     "Return ONLY a compact JSON object, nothing else, in exactly this shape:\n"
-    "{{\"title\": \"...\", \"fact\": \"...\"}}\n\n"
+    "{{\"title\": \"...\", \"fact\": \"...\", \"checkin\": \"...\"}}\n\n"
     "Rules:\n"
     "- title: a short 3-6 word headline / hook (e.g. \"The Great Banyan "
     "Tree\").\n"
     "- fact: 2-3 sentences, CRISP, HARD MAX ~60 words.\n"
-    "- Plain text only. NO Markdown, NO asterisks, NO HTML tags, no bullet "
-    "points, no preamble.\n"
-    "- For any Bengali or Hindi word/name/term, write it inline as: "
-    "NATIVE_SCRIPT (transliteration, \"meaning\") in plain text, e.g. "
+    "- checkin: a short, warm, casual one-liner (max ~12 words) addressed to "
+    "{name} asking how they are doing / a gentle \"you doing ok? mind at "
+    "ease?\" vibe. Personalize it with the name {name}. Vary the phrasing "
+    "each time. A single trailing emoji is allowed but optional.\n"
+    "- Plain text only for every field. NO Markdown, NO asterisks, NO HTML "
+    "tags, no bullet points, no preamble.\n"
+    "- For any Bengali or Hindi word/name/term in the fact, write it inline "
+    "as: NATIVE_SCRIPT (transliteration, \"meaning\") in plain text, e.g. "
     "\u09a8\u09a6\u09c0 (nodi, \"river\").\n"
     "- Prefer surprising specifics over common, well-known trivia."
 )
@@ -98,6 +133,22 @@ def require_env(name):
         log.error("Missing required environment variable: %s", name)
         sys.exit(1)
     return value
+
+
+def parse_probability(raw, default=DEFAULT_CHECKIN_PROBABILITY):
+    """Parse a probability from a string, clamped to [0, 1].
+
+    Empty/invalid input falls back to `default`.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return default
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        log.warning("Invalid CHECKIN_PROBABILITY %r; using %.2f", raw, default)
+        return default
+    return max(0.0, min(1.0, value))
 
 
 def load_topics(path=TOPICS_PATH):
@@ -168,8 +219,8 @@ def build_avoid_list(history, topic, limit=AVOID_LIST_SIZE):
     return avoid
 
 
-def build_prompt(topic, avoid_list):
-    prompt = PROMPT_TEMPLATE.format(topic=topic)
+def build_prompt(topic, avoid_list, name):
+    prompt = PROMPT_TEMPLATE.format(topic=topic, name=name)
     if avoid_list:
         bullets = "\n".join("- " + a for a in avoid_list if a)
         prompt += (
@@ -200,22 +251,26 @@ def _extract_json_object(text):
 
 
 def parse_model_text(text, topic):
-    """Return (title, fact) from model output, robust to fences/prose.
+    """Return (title, fact, checkin) from model output, robust to fences/prose.
 
     Falls back to title=topic and the raw stripped text (asterisks removed)
-    when no valid JSON object is found.
+    when no valid JSON object is found. `checkin` is optional and defaults to
+    an empty string when missing/blank — its absence never breaks title/fact.
     """
     obj = _extract_json_object(text)
+    checkin = ""
     if isinstance(obj, dict) and obj.get("fact"):
         title = str(obj.get("title") or topic).strip()
         fact = str(obj.get("fact")).strip()
+        checkin = str(obj.get("checkin") or "").strip()
     else:
         title = topic
         fact = text.strip()
     # Belt-and-braces: strip stray Markdown asterisks the model may emit.
     title = title.replace("*", "").strip()
     fact = fact.replace("*", "").strip()
-    return title, fact
+    checkin = checkin.replace("*", "").strip()
+    return title, fact, checkin
 
 
 def fetch_fact_raw(prompt, api_key, model):
@@ -259,25 +314,28 @@ def fetch_fact_raw(prompt, api_key, model):
     return text
 
 
-def generate_unique_fact(topic, api_key, model, history):
-    """Generate a (title, fact, hash) that is not already in history.
+def generate_unique_fact(topic, api_key, model, history, name):
+    """Generate a (title, fact, hash, checkin) not already in history.
 
-    Retries up to MAX_DEDUP_RETRIES, growing the avoid-list with each
-    just-produced duplicate. After exhausting retries, returns the last fact
-    anyway (a rare repeat beats sending nothing).
+    De-duplication is based ONLY on the fact (via its hash); the check-in line
+    is cosmetic and never affects the hash or the retry decision. Retries up to
+    MAX_DEDUP_RETRIES, growing the avoid-list with each just-produced
+    duplicate. After exhausting retries, returns the last fact anyway (a rare
+    repeat beats sending nothing).
     """
     seen = {e.get("hash") for e in history if e.get("hash")}
     avoid = build_avoid_list(history, topic)
 
     title = fact = fhash = None
+    checkin = ""
     for attempt in range(1, MAX_DEDUP_RETRIES + 1):
-        prompt = build_prompt(topic, avoid)
+        prompt = build_prompt(topic, avoid, name)
         raw = fetch_fact_raw(prompt, api_key, model)
-        title, fact = parse_model_text(raw, topic)
+        title, fact, checkin = parse_model_text(raw, topic)
         fhash = fact_hash(fact)
         if fhash not in seen:
             log.info("Got a new fact on attempt %d", attempt)
-            return title, fact, fhash
+            return title, fact, fhash, checkin
         log.warning("Attempt %d produced a duplicate fact; retrying", attempt)
         # Feed the duplicate back so the model avoids it next time.
         avoid.append("{} — {}".format(
@@ -287,16 +345,35 @@ def generate_unique_fact(topic, api_key, model, history):
         "Still duplicate after %d attempts; sending it anyway",
         MAX_DEDUP_RETRIES,
     )
-    return title, fact, fhash
+    return title, fact, fhash, checkin
 
 
-def compose_message(topic, title, fact):
-    """Compact 3-line HTML message; every field html.escape'd (plain text)."""
-    return "\U0001f4a1 <b>{title}</b>\n<i>{topic}</i>\n\n{fact}".format(
+def resolve_checkin(model_checkin, name):
+    """Return a usable check-in line, personalized with `name`.
+
+    Uses the model's line when it's non-empty and not too long; otherwise
+    falls back to a random curated line. Any stray asterisks are stripped.
+    """
+    candidate = (model_checkin or "").replace("*", "").strip()
+    if candidate and len(candidate) <= MAX_CHECKIN_CHARS:
+        return candidate
+    return random.choice(CHECKIN_FALLBACKS).format(name=name)
+
+
+def compose_message(topic, title, fact, checkin=None):
+    """Compact 3-line HTML message; every field html.escape'd (plain text).
+
+    When `checkin` is provided (non-empty), append a blank line then the
+    check-in as an italic final line. The check-in is html.escape'd too.
+    """
+    message = "\U0001f4a1 <b>{title}</b>\n<i>{topic}</i>\n\n{fact}".format(
         title=html.escape(title),
         topic=html.escape(topic),
         fact=html.escape(fact),
     )
+    if checkin:
+        message += "\n\n<i>" + html.escape(checkin.replace("*", "").strip()) + "</i>"
+    return message
 
 
 def send_telegram(token, chat_id, message):
@@ -334,6 +411,10 @@ def main():
     api_key = require_env("GEMINI_API_KEY")
     model = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
 
+    checkin_name = os.environ.get("CHECKIN_NAME", "").strip() or DEFAULT_CHECKIN_NAME
+    checkin_prob = parse_probability(
+        os.environ.get("CHECKIN_PROBABILITY", ""))
+
     topics = load_topics()
     if not topics:
         log.error("No topics found in %s", TOPICS_PATH)
@@ -345,15 +426,22 @@ def main():
     log.info("Using Gemini model: %s", model)
     log.info("History entries loaded: %d", len(history))
 
-    title, fact, fhash = generate_unique_fact(topic, api_key, model, history)
+    title, fact, fhash, model_checkin = generate_unique_fact(
+        topic, api_key, model, history, checkin_name)
     log.info("Fact title: %s", title)
     log.info("Fact (%d chars, ~%d words)", len(fact), len(fact.split()))
 
-    message = compose_message(topic, title, fact)
+    # Occasional cosmetic check-in — computed AFTER dedup; not part of the fact.
+    add_checkin = random.random() < checkin_prob
+    checkin = resolve_checkin(model_checkin, checkin_name) if add_checkin else None
+    log.info("Check-in appended: %s", bool(checkin))
+
+    message = compose_message(topic, title, fact, checkin)
     message_id = send_telegram(token, chat_id, message)
     log.info("Telegram message sent (message_id=%s)", message_id)
 
-    # Only record history after a confirmed successful send.
+    # Only record history after a confirmed successful send. The check-in is
+    # intentionally NOT stored and NOT part of the hash.
     entry = {
         "ts": datetime.datetime.now(datetime.timezone.utc)
         .isoformat(timespec="seconds")

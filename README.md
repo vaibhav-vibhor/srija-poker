@@ -45,7 +45,22 @@ secret**:
 | `GEMINI_API_KEY`     | Create a free API key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). |
 
 Optional: set a `GEMINI_MODEL` repository **variable** (or env var locally) to
-override the model. The default is `gemini-2.0-flash`.
+override the model. The default is `gemini-flash-latest`.
+
+### Optional: personal check-in line
+
+Occasionally (10% of runs by default) a short, warm one-liner addressed to a
+person is appended to the end of the message — a light "how are you doing?"
+check-in. It's generated as part of the same Gemini call (no extra API
+request), with a curated fallback pool if the model omits it. Configure via
+repository **variables** (or local env):
+
+| Variable              | Default  | Meaning |
+| --------------------- | -------- | ------- |
+| `CHECKIN_NAME`        | `Sreeja` | Who the check-in is addressed to. |
+| `CHECKIN_PROBABILITY` | `0.10`   | Per-run chance (0.0–1.0) of adding the line. Invalid values fall back to 0.10. |
+
+Set `CHECKIN_PROBABILITY=0` to disable it entirely.
 
 ## Running locally
 
@@ -107,6 +122,12 @@ are set.
 
 The script exits `0` on success and non-zero only on a real model or delivery
 failure, so failed runs show up clearly in the Actions log.
+
+An optional check-in line (see
+[Optional: personal check-in line](#optional-personal-check-in-line)) may be
+appended after the fact. It is purely cosmetic: it is added after
+de-duplication has run, is never part of the fact hash, and is not stored in
+`data/history.jsonl`.
 
 ### De-duplication
 
