@@ -20,6 +20,7 @@ import os
 import random
 import re
 import sys
+import time
 
 import requests
 
@@ -47,6 +48,28 @@ REQUEST_TIMEOUT = 60
 AVOID_LIST_SIZE = 30
 # How many retries when a generated fact duplicates something already sent.
 MAX_DEDUP_RETRIES = 4
+
+# --- Resilient model retry / fallback configuration ---
+# Priority-ordered fallback chain (best -> lesser), all known-good on the key.
+# The effective list is [primary] + these (de-duplicated, order preserved),
+# where primary is GEMINI_MODEL if set else DEFAULT_GEMINI_MODEL.
+DEFAULT_FALLBACK_MODELS = [
+    "gemini-flash-lite-latest",
+    "gemini-3-flash-preview",
+]
+# Attempts against EACH model before moving to the next one.
+DEFAULT_RETRIES_PER_MODEL = 2
+# Exponential backoff between same-model attempts (seconds).
+BACKOFF_BASE = 2.0
+BACKOFF_CAP = 20.0
+# Overall wall-clock budget for the whole cascade, so a job can't hang.
+OVERALL_BUDGET_SECONDS = 90.0
+
+# HTTP codes / API statuses that are worth retrying vs. giving up on a model.
+TRANSIENT_HTTP = {429, 500, 502, 503, 504}
+PERMANENT_HTTP = {400, 401, 403, 404}
+TRANSIENT_STATUSES = {"UNAVAILABLE", "RESOURCE_EXHAUSTED", "INTERNAL"}
+PERMANENT_STATUSES = {"NOT_FOUND", "PERMISSION_DENIED", "INVALID_ARGUMENT"}
 
 # Occasional personal check-in configuration (overridable via env).
 DEFAULT_CHECKIN_NAME = "Sreeja"
@@ -149,6 +172,35 @@ def parse_probability(raw, default=DEFAULT_CHECKIN_PROBABILITY):
         log.warning("Invalid CHECKIN_PROBABILITY %r; using %.2f", raw, default)
         return default
     return max(0.0, min(1.0, value))
+
+
+def parse_int_env(name, default, minimum=1):
+    """Parse a positive int from env; empty/invalid/out-of-range -> default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log.warning("Invalid %s %r; using %d", name, raw, default)
+        return default
+    return value if value >= minimum else default
+
+
+def build_model_list(primary, fallback_raw):
+    """Effective priority list: [primary] + fallbacks, de-duped, order kept.
+
+    `fallback_raw` is a comma-separated override; blank entries are ignored and
+    an empty/blank override falls back to DEFAULT_FALLBACK_MODELS.
+    """
+    fallbacks = [m.strip() for m in (fallback_raw or "").split(",") if m.strip()]
+    if not fallbacks:
+        fallbacks = list(DEFAULT_FALLBACK_MODELS)
+    ordered = [primary]
+    for m in fallbacks:
+        if m and m not in ordered:
+            ordered.append(m)
+    return ordered
 
 
 def load_topics(path=TOPICS_PATH):
@@ -273,55 +325,158 @@ def parse_model_text(text, topic):
     return title, fact, checkin
 
 
-def fetch_fact_raw(prompt, api_key, model):
-    """Call Gemini once and return raw text, or exit(1) on hard failure."""
-    url = GEMINI_URL.format(model=model, key=api_key)
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+class GeminiExhaustedError(RuntimeError):
+    """Raised when every model in the cascade has been exhausted."""
 
+    def __init__(self, tried, last_detail):
+        self.tried = list(tried)
+        self.last_detail = last_detail
+        super().__init__(
+            "All Gemini models exhausted (tried: {}; last status: {})".format(
+                ", ".join(self.tried) or "none", last_detail))
+
+
+def parse_retry_delay(data):
+    """Extract RetryInfo.retryDelay (seconds) from an error body, else None."""
     try:
-        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        log.error("Gemini request failed: %s", exc)
-        sys.exit(1)
+        details = (data.get("error", {}) or {}).get("details") or []
+        for d in details:
+            if "RetryInfo" in str(d.get("@type", "")):
+                m = re.match(r"^\s*([0-9.]+)s?\s*$", str(d.get("retryDelay", "")))
+                if m:
+                    return float(m.group(1))
+    except (AttributeError, ValueError, TypeError):
+        pass
+    return None
 
-    if resp.status_code != 200:
-        log.error("Gemini returned HTTP %s: %s", resp.status_code, resp.text)
-        sys.exit(1)
 
+def compute_backoff(attempt, retry_hint=None, base=BACKOFF_BASE,
+                    cap=BACKOFF_CAP, jitter=True):
+    """Exponential backoff with jitter for same-model attempt `attempt` (1-based).
+
+    Honors a server RetryInfo hint when given, but every wait is capped at
+    `cap` seconds.
+    """
+    if retry_hint is not None:
+        wait = min(retry_hint, cap)
+    else:
+        wait = min(base * (2 ** max(0, attempt - 1)), cap)
+    if jitter:
+        wait += random.uniform(0, 1)
+    return min(wait, cap)
+
+
+def _classify_gemini_response(resp):
+    """Classify a Response into (kind, text, detail, retry_delay).
+
+    kind is 'success' | 'transient' | 'permanent'.
+    """
+    code = resp.status_code
     try:
         data = resp.json()
     except ValueError:
-        log.error("Gemini response was not valid JSON: %s", resp.text)
-        sys.exit(1)
+        data = None
 
-    candidates = data.get("candidates") or []
-    if not candidates:
-        log.error("Gemini returned no candidates: %s", resp.text)
-        sys.exit(1)
+    status = ""
+    retry_delay = None
+    if isinstance(data, dict) and data.get("error"):
+        status = str(data["error"].get("status", "")).upper()
+        retry_delay = parse_retry_delay(data)
 
-    candidate = candidates[0]
-    finish_reason = candidate.get("finishReason")
-    parts = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts).strip()
+    if code == 200:
+        if isinstance(data, dict):
+            candidates = data.get("candidates") or []
+            if candidates:
+                parts = (candidates[0].get("content") or {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    return "success", text, "200", None
+        # 200 but empty/blocked -> retry then fall back (never hard-succeed).
+        return "transient", None, "200-empty", None
 
-    if not text:
-        log.error(
-            "Gemini returned empty output (finishReason=%s): %s",
-            finish_reason, resp.text,
-        )
-        sys.exit(1)
-
-    return text
+    if code in PERMANENT_HTTP or status in PERMANENT_STATUSES:
+        return "permanent", None, (status or str(code)), None
+    if code in TRANSIENT_HTTP or status in TRANSIENT_STATUSES:
+        return "transient", None, (status or str(code)), retry_delay
+    # Unknown non-200: don't hammer this model, move on.
+    return "permanent", None, (status or str(code)), None
 
 
-def generate_unique_fact(topic, api_key, model, history, name):
+def _call_gemini_once(prompt, api_key, model):
+    """Single generateContent call. Never logs the key/URL. Never sys.exit()s."""
+    url = GEMINI_URL.format(model=model, key=api_key)
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        # Network/timeout/connection issue: transient, retry same model.
+        return "transient", None, "network:{}".format(type(exc).__name__), None
+    return _classify_gemini_response(resp)
+
+
+def call_gemini_resilient(prompt, api_key, models, retries_per_model=None,
+                          overall_budget=OVERALL_BUDGET_SECONDS,
+                          sleep=time.sleep, primary=None):
+    """Try models in priority order, retrying transient failures per model.
+
+    Returns (raw_text, model_used) on the FIRST success (best available).
+    Raises GeminiExhaustedError if all models/attempts/budget are exhausted.
+    """
+    retries = (retries_per_model if retries_per_model is not None
+               else parse_int_env("RETRIES_PER_MODEL", DEFAULT_RETRIES_PER_MODEL))
+    if primary is None and models:
+        primary = models[0]
+    deadline = time.monotonic() + overall_budget
+    tried = []
+    last_detail = None
+
+    for model in models:
+        tried.append(model)
+        for attempt in range(1, retries + 1):
+            if time.monotonic() >= deadline:
+                log.warning("Overall Gemini budget (%.0fs) exhausted; stopping",
+                            overall_budget)
+                raise GeminiExhaustedError(tried, last_detail or "budget")
+
+            log.info("Trying model %s (attempt %d/%d)", model, attempt, retries)
+            kind, text, detail, retry_delay = _call_gemini_once(
+                prompt, api_key, model)
+
+            if kind == "success":
+                log.info("Using model %s", model)
+                if model != primary:
+                    log.info("(fell back from %s)", primary)
+                return text, model
+
+            last_detail = detail
+            if kind == "permanent":
+                log.warning(
+                    "Model %s unavailable/permanent %s; skipping to next model",
+                    model, detail)
+                break
+
+            # transient
+            if attempt < retries:
+                wait = compute_backoff(attempt, retry_delay)
+                wait = min(wait, max(0.0, deadline - time.monotonic()))
+                log.warning("Model %s transient %s; backing off %.1fs",
+                            model, detail, wait)
+                sleep(wait)
+            else:
+                log.warning("Model %s transient %s; falling back to next model",
+                            model, detail)
+
+    raise GeminiExhaustedError(tried, last_detail)
+
+
+def generate_unique_fact(topic, api_key, models, history, name):
     """Generate a (title, fact, hash, checkin) not already in history.
 
-    De-duplication is based ONLY on the fact (via its hash); the check-in line
-    is cosmetic and never affects the hash or the retry decision. Retries up to
-    MAX_DEDUP_RETRIES, growing the avoid-list with each just-produced
-    duplicate. After exhausting retries, returns the last fact anyway (a rare
-    repeat beats sending nothing).
+    Each of the (up to MAX_DEDUP_RETRIES) generations goes through
+    call_gemini_resilient, so every attempt is independently resilient to a
+    transient model outage. De-duplication is based ONLY on the fact hash; the
+    check-in line is cosmetic and never affects the hash or the retry decision.
+    Raises GeminiExhaustedError if the transport cascade is exhausted.
     """
     seen = {e.get("hash") for e in history if e.get("hash")}
     avoid = build_avoid_list(history, topic)
@@ -330,11 +485,12 @@ def generate_unique_fact(topic, api_key, model, history, name):
     checkin = ""
     for attempt in range(1, MAX_DEDUP_RETRIES + 1):
         prompt = build_prompt(topic, avoid, name)
-        raw = fetch_fact_raw(prompt, api_key, model)
+        raw, model_used = call_gemini_resilient(prompt, api_key, models)
         title, fact, checkin = parse_model_text(raw, topic)
         fhash = fact_hash(fact)
         if fhash not in seen:
-            log.info("Got a new fact on attempt %d", attempt)
+            log.info("Got a new fact on attempt %d (model=%s)",
+                     attempt, model_used)
             return title, fact, fhash, checkin
         log.warning("Attempt %d produced a duplicate fact; retrying", attempt)
         # Feed the duplicate back so the model avoids it next time.
@@ -409,7 +565,9 @@ def main():
     token = require_env("TELEGRAM_BOT_TOKEN")
     chat_id = require_env("CHAT_ID")
     api_key = require_env("GEMINI_API_KEY")
-    model = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+    primary = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+    models = build_model_list(
+        primary, os.environ.get("GEMINI_FALLBACK_MODELS", ""))
 
     checkin_name = os.environ.get("CHECKIN_NAME", "").strip() or DEFAULT_CHECKIN_NAME
     checkin_prob = parse_probability(
@@ -423,11 +581,15 @@ def main():
     history = load_history()
     topic = random.choice(topics)
     log.info("Chosen topic: %s", topic)
-    log.info("Using Gemini model: %s", model)
+    log.info("Model priority: %s", " -> ".join(models))
     log.info("History entries loaded: %d", len(history))
 
-    title, fact, fhash, model_checkin = generate_unique_fact(
-        topic, api_key, model, history, checkin_name)
+    try:
+        title, fact, fhash, model_checkin = generate_unique_fact(
+            topic, api_key, models, history, checkin_name)
+    except GeminiExhaustedError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
     log.info("Fact title: %s", title)
     log.info("Fact (%d chars, ~%d words)", len(fact), len(fact.split()))
 
