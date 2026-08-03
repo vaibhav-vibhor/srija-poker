@@ -45,7 +45,30 @@ secret**:
 | `GEMINI_API_KEY`     | Create a free API key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). |
 
 Optional: set a `GEMINI_MODEL` repository **variable** (or env var locally) to
-override the model. The default is `gemini-flash-latest`.
+override the model. The default is `gemini-flash-latest`. This model becomes the
+**primary** one tried first.
+
+### Model retry &amp; fallback
+
+If the primary model returns a transient error (HTTP 429/500/502/503/504 or an
+`UNAVAILABLE` / `RESOURCE_EXHAUSTED` / `INTERNAL` status, or a network/timeout),
+the bot retries it a couple of times with exponential backoff (honoring the
+server's `RetryInfo.retryDelay` hint, capped at 20s) and then **falls back**
+through a prioritized list of models, using the first one that returns a good
+response. Permanent errors (400/401/403/404, `NOT_FOUND`, `PERMISSION_DENIED`,
+`INVALID_ARGUMENT`) skip that model immediately with no backoff. Healthy runs pay
+zero extra cost — the primary is used directly. Only if **every** model is
+exhausted does the run fail (exit 1). Configure via repository **variables** (or
+local env):
+
+| Variable                 | Default                                        | Meaning |
+| ------------------------ | ---------------------------------------------- | ------- |
+| `GEMINI_MODEL`           | `gemini-flash-latest`                          | Primary model, tried first. |
+| `GEMINI_FALLBACK_MODELS` | `gemini-flash-lite-latest,gemini-3-flash-preview` | Comma-separated fallback chain, in priority order. |
+| `RETRIES_PER_MODEL`      | `2`                                            | Attempts against each model before moving to the next. |
+
+The effective list is `[primary] + fallbacks` with duplicates removed and order
+preserved.
 
 ### Optional: personal check-in line
 
